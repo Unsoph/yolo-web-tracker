@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as ort from 'onnxruntime-web';
 import { processYoloOutput } from './utils/yoloUtils';
 import { SimpleTracker, type TrackedObject } from './utils/tracker';
@@ -8,41 +8,82 @@ function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [modelLoaded, setModelLoaded] = useState(false);
   const [selectedTrackId, setSelectedTrackId] = useState<number | null>(null);
+  const [fps, setFps] = useState(0);
 
-  // We keep these in refs so they persist across renders and the animation loop can access them
+  // Refs for the animation loop (these persist without causing re-renders)
   const trackerRef = useRef(new SimpleTracker());
   const selectedTrackIdRef = useRef<number | null>(null);
   const currentTracksRef = useRef<TrackedObject[]>([]);
   const facingModeRef = useRef<'user' | 'environment'>('environment');
+  const runningRef = useRef(true);
 
-  // Update ref when state changes
+  // Keep ref in sync with state
   useEffect(() => {
     selectedTrackIdRef.current = selectedTrackId;
   }, [selectedTrackId]);
+
+  // ---- Hit-test logic shared between mouse and touch ----
+  const hitTest = useCallback((clientX: number, clientY: number) => {
+    if (!canvasRef.current) return;
+    const rect = canvasRef.current.getBoundingClientRect();
+    const scaleX = canvasRef.current.width / rect.width;
+    const scaleY = canvasRef.current.height / rect.height;
+    const x = (clientX - rect.left) * scaleX;
+    const y = (clientY - rect.top) * scaleY;
+
+    // Pad the hitbox by 15px on each side so tapping on mobile is forgiving
+    const pad = 15;
+    let clickedOnObject = false;
+
+    for (const track of currentTracksRef.current) {
+      if (
+        x >= track.x1 - pad && x <= track.x2 + pad &&
+        y >= track.y1 - pad && y <= track.y2 + pad
+      ) {
+        setSelectedTrackId(track.trackId);
+        clickedOnObject = true;
+        break;
+      }
+    }
+
+    if (!clickedOnObject) {
+      setSelectedTrackId(null);
+    }
+  }, []);
+
+  // Mouse click handler (desktop)
+  const handleCanvasClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
+    hitTest(e.clientX, e.clientY);
+  }, [hitTest]);
+
+  // Touch handler (mobile)
+  const handleCanvasTouch = useCallback((e: React.TouchEvent<HTMLCanvasElement>) => {
+    e.preventDefault(); // prevent double-firing with click
+    if (e.touches.length > 0) {
+      hitTest(e.touches[0].clientX, e.touches[0].clientY);
+    }
+  }, [hitTest]);
 
   // Function to switch between front and back camera
   const toggleCamera = async () => {
     const newMode = facingModeRef.current === 'user' ? 'environment' : 'user';
     facingModeRef.current = newMode;
-    
+
     // Stop existing stream
     if (videoRef.current && videoRef.current.srcObject) {
       const stream = videoRef.current.srcObject as MediaStream;
       stream.getTracks().forEach(track => track.stop());
     }
 
-    // Start new stream with new facingMode
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ 
-        video: { facingMode: newMode }, 
-        audio: false 
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: newMode },
+        audio: false
       });
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
         await new Promise((resolve) => {
-          if (videoRef.current) {
-            videoRef.current.onloadedmetadata = resolve;
-          }
+          if (videoRef.current) videoRef.current.onloadedmetadata = resolve;
         });
         videoRef.current.play();
       }
@@ -51,23 +92,21 @@ function App() {
     }
   };
 
+  // ---- Main effect: camera + model + inference loop ----
   useEffect(() => {
     let session: ort.InferenceSession;
-    let animationId: number;
+    runningRef.current = true;
 
     const setupCamera = async () => {
       try {
-        const stream = await navigator.mediaDevices.getUserMedia({ 
-          video: { facingMode: facingModeRef.current }, 
-          audio: false 
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { facingMode: facingModeRef.current },
+          audio: false
         });
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
-          // Wait for video to be ready
           await new Promise((resolve) => {
-            if (videoRef.current) {
-              videoRef.current.onloadedmetadata = resolve;
-            }
+            if (videoRef.current) videoRef.current.onloadedmetadata = resolve;
           });
           videoRef.current.play();
         }
@@ -79,7 +118,6 @@ function App() {
     const loadModelAndRun = async () => {
       await setupCamera();
 
-      // Load ONNX Model
       try {
         session = await ort.InferenceSession.create('/yolov8n.onnx');
         setModelLoaded(true);
@@ -94,101 +132,110 @@ function App() {
       offscreenCanvas.height = 640;
       const offscreenCtx = offscreenCanvas.getContext('2d');
 
-      const processFrame = async () => {
+      // ---- GATED INFERENCE LOOP ----
+      // Instead of requestAnimationFrame (which fires before inference finishes),
+      // we use a while-loop with awaits. The next frame only starts AFTER the
+      // previous inference is completely done. This prevents frame pile-up.
+      let lastTime = performance.now();
+
+      while (runningRef.current) {
         if (!videoRef.current || !canvasRef.current || !offscreenCtx || !session) {
-          animationId = requestAnimationFrame(processFrame);
-          return;
+          await new Promise(r => setTimeout(r, 100));
+          continue;
         }
 
         const video = videoRef.current;
         const canvas = canvasRef.current;
         const ctx = canvas.getContext('2d');
-        if (!ctx) return;
+        if (!ctx) break;
 
-        // Make sure video is ready
         if (video.videoWidth === 0 || video.videoHeight === 0) {
-            animationId = requestAnimationFrame(processFrame);
-            return;
+          await new Promise(r => setTimeout(r, 100));
+          continue;
         }
 
-        // Match canvas size to video size
+        // Match canvas to video
         if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
           canvas.width = video.videoWidth;
           canvas.height = video.videoHeight;
         }
 
-        // Draw video to offscreen canvas (scaling it to 640x640 for YOLO)
+        // Draw video → 640x640 offscreen canvas for YOLO
         offscreenCtx.drawImage(video, 0, 0, 640, 640);
         const imgData = offscreenCtx.getImageData(0, 0, 640, 640).data;
 
-        // Convert ImageData (RGBA) to Float32Array RGB [1, 3, 640, 640] normalized to 0-1
+        // RGBA → CHW float32 normalized
         const float32Data = new Float32Array(3 * 640 * 640);
         for (let i = 0; i < 640 * 640; i++) {
-            float32Data[i] = imgData[i * 4] / 255.0; // R
-            float32Data[640 * 640 + i] = imgData[i * 4 + 1] / 255.0; // G
-            float32Data[2 * 640 * 640 + i] = imgData[i * 4 + 2] / 255.0; // B
+          float32Data[i]                   = imgData[i * 4]     / 255.0; // R
+          float32Data[640 * 640 + i]       = imgData[i * 4 + 1] / 255.0; // G
+          float32Data[2 * 640 * 640 + i]   = imgData[i * 4 + 2] / 255.0; // B
         }
 
-        // Run Inference
+        // Run inference (this is the slow part — we AWAIT it)
         const tensor = new ort.Tensor('float32', float32Data, inputShape);
         const results = await session.run({ images: tensor });
-        
-        // Output from YOLOv8 is named 'output0'
-        const outputTensor = results.output0; 
+
+        const outputTensor = results.output0;
         const boxes = processYoloOutput(outputTensor.data as Float32Array);
 
-        // Map boxes from 640x640 back to the original video dimensions
+        // Scale boxes from 640x640 back to video resolution
         const scaleX = video.videoWidth / 640;
         const scaleY = video.videoHeight / 640;
-        boxes.forEach(box => {
-            box.x1 *= scaleX;
-            box.x2 *= scaleX;
-            box.y1 *= scaleY;
-            box.y2 *= scaleY;
-        });
+        for (const box of boxes) {
+          box.x1 *= scaleX;
+          box.x2 *= scaleX;
+          box.y1 *= scaleY;
+          box.y2 *= scaleY;
+        }
 
-        // Run Tracker
+        // Run tracker
         const tracks = trackerRef.current.update(boxes);
         currentTracksRef.current = tracks;
 
-        // Draw on main canvas
+        // Draw bounding boxes on canvas
         ctx.clearRect(0, 0, canvas.width, canvas.height);
-        
+
         for (const track of tracks) {
-            // Only draw if we haven't selected something, OR if this is the selected thing
-            if (selectedTrackIdRef.current !== null && track.trackId !== selectedTrackIdRef.current) {
-                continue;
-            }
+          if (selectedTrackIdRef.current !== null && track.trackId !== selectedTrackIdRef.current) {
+            continue;
+          }
 
-            const isLocked = track.trackId === selectedTrackIdRef.current;
-            ctx.strokeStyle = isLocked ? '#ff0000' : '#00ff00';
-            ctx.lineWidth = isLocked ? 4 : 2;
-            
-            ctx.beginPath();
-            ctx.rect(track.x1, track.y1, track.x2 - track.x1, track.y2 - track.y1);
-            ctx.stroke();
+          const isLocked = track.trackId === selectedTrackIdRef.current;
+          const color = isLocked ? '#ff0000' : '#00ff00';
+          const lineW = isLocked ? 4 : 2;
 
-            // Draw label
-            ctx.fillStyle = isLocked ? '#ff0000' : '#00ff00';
-            ctx.font = '16px Arial';
-            ctx.fillText(
-                isLocked ? `LOCKED ID: ${track.trackId}` : `ID: ${track.trackId}`, 
-                track.x1, 
-                track.y1 - 5
-            );
+          ctx.strokeStyle = color;
+          ctx.lineWidth = lineW;
+          ctx.beginPath();
+          ctx.rect(track.x1, track.y1, track.x2 - track.x1, track.y2 - track.y1);
+          ctx.stroke();
+
+          // Label with background for readability
+          const label = isLocked ? `LOCKED ID: ${track.trackId}` : `ID: ${track.trackId}`;
+          ctx.font = 'bold 14px Arial';
+          const textW = ctx.measureText(label).width;
+          ctx.fillStyle = 'rgba(0,0,0,0.6)';
+          ctx.fillRect(track.x1, track.y1 - 20, textW + 8, 20);
+          ctx.fillStyle = color;
+          ctx.fillText(label, track.x1 + 4, track.y1 - 5);
         }
 
-        // Loop
-        animationId = requestAnimationFrame(processFrame);
-      };
+        // FPS counter
+        const now = performance.now();
+        const delta = now - lastTime;
+        lastTime = now;
+        if (delta > 0) setFps(Math.round(1000 / delta));
 
-      processFrame();
+        // Yield to the browser so the UI stays responsive
+        await new Promise(r => requestAnimationFrame(r));
+      }
     };
 
     loadModelAndRun();
 
     return () => {
-      cancelAnimationFrame(animationId);
+      runningRef.current = false;
       if (videoRef.current && videoRef.current.srcObject) {
         const stream = videoRef.current.srcObject as MediaStream;
         stream.getTracks().forEach(track => track.stop());
@@ -196,90 +243,83 @@ function App() {
     };
   }, []);
 
-  // Handle canvas clicks for target locking
-  const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!canvasRef.current) return;
-    
-    // Get click coordinates relative to the canvas
-    const rect = canvasRef.current.getBoundingClientRect();
-    
-    // Scale coordinates if the canvas is responsive on mobile
-    const scaleX = canvasRef.current.width / rect.width;
-    const scaleY = canvasRef.current.height / rect.height;
-    
-    const x = (e.clientX - rect.left) * scaleX;
-    const y = (e.clientY - rect.top) * scaleY;
-
-    let clickedOnObject = false;
-
-    // Check if the click falls inside any tracked object
-    for (const track of currentTracksRef.current) {
-        if (x >= track.x1 && x <= track.x2 && y >= track.y1 && y <= track.y2) {
-            setSelectedTrackId(track.trackId);
-            clickedOnObject = true;
-            break;
-        }
-    }
-
-    if (!clickedOnObject) {
-        setSelectedTrackId(null);
-    }
-  };
-
   return (
-    <div style={{ fontFamily: 'sans-serif', textAlign: 'center', padding: '10px' }}>
-      <h2>Drone Tracker (Web)</h2>
-      <p style={{ fontSize: '14px', marginBottom: '10px' }}>
-        {modelLoaded 
-            ? "Model loaded! Click on a bounding box to lock onto it. Click the background to clear." 
-            : "Loading YOLOv8 ONNX Model (this may take a few seconds)..."}
+    <div style={{ fontFamily: 'sans-serif', textAlign: 'center', padding: '10px', background: '#111', color: '#eee', minHeight: '100vh' }}>
+      <h2 style={{ margin: '5px 0' }}>Drone Tracker</h2>
+      <p style={{ fontSize: '13px', margin: '5px 0 10px', color: '#aaa' }}>
+        {modelLoaded
+          ? "Tap a bounding box to lock. Tap background to unlock."
+          : "Loading YOLOv8 model…"}
       </p>
 
-      {/* Camera Toggle Button */}
-      <button 
-        onClick={toggleCamera} 
-        style={{ 
-          marginBottom: '15px', 
-          padding: '10px 20px', 
-          fontSize: '16px',
-          backgroundColor: '#0070f3',
-          color: 'white',
-          border: 'none',
-          borderRadius: '5px',
-          cursor: 'pointer'
-        }}
-      >
-        Flip Camera 🔄
-      </button>
+      {/* Controls */}
+      <div style={{ display: 'flex', justifyContent: 'center', gap: '10px', marginBottom: '10px', flexWrap: 'wrap' }}>
+        <button
+          onClick={toggleCamera}
+          style={{
+            padding: '10px 20px',
+            fontSize: '15px',
+            backgroundColor: '#0070f3',
+            color: 'white',
+            border: 'none',
+            borderRadius: '8px',
+            cursor: 'pointer'
+          }}
+        >
+          Flip Camera 🔄
+        </button>
+        {selectedTrackId !== null && (
+          <button
+            onClick={() => setSelectedTrackId(null)}
+            style={{
+              padding: '10px 20px',
+              fontSize: '15px',
+              backgroundColor: '#e00',
+              color: 'white',
+              border: 'none',
+              borderRadius: '8px',
+              cursor: 'pointer'
+            }}
+          >
+            Unlock Target 🔓
+          </button>
+        )}
+      </div>
 
       {selectedTrackId !== null && (
-        <h3 style={{ color: 'red', marginTop: '0' }}>Target Locked: ID {selectedTrackId}</h3>
+        <h3 style={{ color: '#ff4444', margin: '5px 0' }}>🔒 Target Locked: ID {selectedTrackId}</h3>
+      )}
+
+      {modelLoaded && (
+        <p style={{ fontSize: '12px', color: '#888', margin: '2px 0 8px' }}>FPS: {fps}</p>
       )}
 
       <div style={{ position: 'relative', display: 'inline-block', width: '100%', maxWidth: '800px' }}>
-        <video 
-            ref={videoRef} 
-            style={{ 
-              display: 'block', 
-              borderRadius: '8px', 
-              border: '2px solid #ccc',
-              width: '100%',
-              height: 'auto'
-            }} 
-            playsInline
-            muted
+        <video
+          ref={videoRef}
+          style={{
+            display: 'block',
+            borderRadius: '8px',
+            border: '2px solid #333',
+            width: '100%',
+            height: 'auto'
+          }}
+          playsInline
+          muted
         />
-        <canvas 
-            ref={canvasRef} 
-            onClick={handleCanvasClick}
-            style={{ 
-                position: 'absolute', 
-                top: 0, 
-                left: 0, 
-                cursor: 'crosshair',
-                width: '100%',
-                height: '100%'
-            }} 
+        <canvas
+          ref={canvasRef}
+          onClick={handleCanvasClick}
+          onTouchStart={handleCanvasTouch}
+          style={{
+            position: 'absolute',
+            top: 0,
+            left: 0,
+            cursor: 'crosshair',
+            width: '100%',
+            height: '100%',
+            touchAction: 'none'   // prevents browser from hijacking touch gestures
+          }}
         />
       </div>
     </div>

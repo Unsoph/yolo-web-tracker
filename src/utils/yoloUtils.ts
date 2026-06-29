@@ -13,8 +13,8 @@ export interface BoundingBox {
  */
 export function processYoloOutput(
     outputData: Float32Array, 
-    confidenceThreshold: number = 0.3,
-    iouThreshold: number = 0.4
+    confidenceThreshold: number = 0.5,
+    iouThreshold: number = 0.3
 ): BoundingBox[] {
     const boxes: BoundingBox[] = [];
     const numClasses = 80;
