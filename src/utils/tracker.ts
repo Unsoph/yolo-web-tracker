@@ -6,16 +6,15 @@ export interface TrackedObject extends BoundingBox {
 }
 
 /**
- * IoU tracker with a special "sticky lock" mode for the selected target.
+ * IoU tracker tuned for LOW FPS (~5-15) with sticky lock mode.
  * 
- * Regular tracks: matched by IoU only (prevents ID swaps on camera pan).
- * Locked target:  gets a distance+size fallback so it doesn't drop when
- *                 the person walks away and their box shrinks.
+ * At 5 FPS each frame is 200ms apart — people move a LOT between frames.
+ * All thresholds are set very permissively to account for this.
  */
 export class SimpleTracker {
     private tracks: TrackedObject[] = [];
     private nextId: number = 1;
-    private maxMissedFrames: number = 15;
+    private maxMissedFrames: number = 20;
 
     public update(detections: BoundingBox[], lockedTrackId: number | null = null): TrackedObject[] {
         if (this.tracks.length === 0) {
@@ -27,13 +26,13 @@ export class SimpleTracker {
             return this.tracks.filter(t => t.missedFrames === 0);
         }
 
-        // Build IoU cost matrix
+        // Build IoU cost matrix with a very low threshold (5 FPS = large movement)
         const iouMatrix: { trackIdx: number; detIdx: number; iou: number }[] = [];
 
         for (let t = 0; t < this.tracks.length; t++) {
             for (let d = 0; d < detections.length; d++) {
                 const iou = calculateIoU(this.tracks[t], detections[d]);
-                if (iou > 0.15) {  // lowered from 0.25 for better continuity
+                if (iou > 0.05) {  // very low — even a tiny overlap counts at low FPS
                     iouMatrix.push({ trackIdx: t, detIdx: d, iou });
                 }
             }
@@ -53,9 +52,8 @@ export class SimpleTracker {
             matchedDets.add(match.detIdx);
         }
 
-        // SPECIAL: If the locked target wasn't matched by IoU, try distance+size fallback.
-        // This ONLY applies to the locked track — not all tracks — so it won't cause
-        // the ID-swap problem on camera pan.
+        // STICKY LOCK: If the locked target wasn't matched by IoU,
+        // use a generous distance + size fallback (ONLY for this one track).
         if (lockedTrackId !== null) {
             const lockedIdx = this.tracks.findIndex(t => t.trackId === lockedTrackId);
             if (lockedIdx !== -1 && !matchedTracks.has(lockedIdx)) {
@@ -65,7 +63,7 @@ export class SimpleTracker {
                 const trackArea = (track.x2 - track.x1) * (track.y2 - track.y1);
 
                 let bestIdx = -1;
-                let bestDist = 200; // generous pixel radius for locked target
+                let bestDist = 400; // very generous — at 5fps people move far
 
                 for (let d = 0; d < detections.length; d++) {
                     if (matchedDets.has(d)) continue;
@@ -77,8 +75,7 @@ export class SimpleTracker {
                     const dist = Math.sqrt((detCx - trackCx) ** 2 + (detCy - trackCy) ** 2);
                     const sizeRatio = Math.min(detArea, trackArea) / Math.max(detArea, trackArea);
 
-                    // Must be reasonably close AND similar size
-                    if (dist < bestDist && sizeRatio > 0.3) {
+                    if (dist < bestDist && sizeRatio > 0.1) {
                         bestDist = dist;
                         bestIdx = d;
                     }

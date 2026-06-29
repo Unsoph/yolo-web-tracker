@@ -4,7 +4,7 @@ import { processYoloOutput } from './utils/yoloUtils';
 import { SimpleTracker, type TrackedObject } from './utils/tracker';
 
 // ---- CONSTANTS ----
-const MODEL_INPUT_SIZE = 640;  // Must match the ONNX export size
+const MODEL_INPUT_SIZE = 320;  // Re-exported ONNX model at 320x320 for ~4x speedup
 const PIXELS = MODEL_INPUT_SIZE * MODEL_INPUT_SIZE;
 
 function App() {
