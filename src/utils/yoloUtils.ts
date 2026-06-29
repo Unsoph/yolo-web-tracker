@@ -35,7 +35,7 @@ export function processYoloOutput(
             }
         }
 
-        if (maxClassConf > confidenceThreshold) {
+        if (maxClassConf > confidenceThreshold && classId === 0) {
             const cx = outputData[0 * numAnchors + i];
             const cy = outputData[1 * numAnchors + i];
             const w = outputData[2 * numAnchors + i];
