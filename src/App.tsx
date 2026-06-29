@@ -178,7 +178,7 @@ function App() {
         }
 
         // Track
-        const tracks = trackerRef.current.update(boxes);
+        const tracks = trackerRef.current.update(boxes, selectedTrackIdRef.current);
         currentTracksRef.current = tracks;
 
         // Draw
