@@ -9,44 +9,39 @@ export interface BoundingBox {
 
 /**
  * Parses the raw Float32Array output from YOLOv8 ONNX model.
- * The ONNX YOLOv8 model outputs a tensor of shape [1, 84, 8400].
+ * OPTIMISED: Only checks class 0 (person) instead of looping all 80 classes.
+ * Uses 320x320 input for speed.
  */
 export function processYoloOutput(
     outputData: Float32Array, 
-    confidenceThreshold: number = 0.5,
-    iouThreshold: number = 0.3
+    confidenceThreshold: number = 0.45,
+    iouThreshold: number = 0.3,
+    numAnchors: number = 6300  // 320x320 produces 6300 anchors
 ): BoundingBox[] {
     const boxes: BoundingBox[] = [];
-    const numClasses = 80;
-    const numAnchors = 8400; // number of predictions
 
-    // The tensor layout is [1, 84, 8400] flattened to a 1D array.
-    // For a specific anchor i and element e, index = e * numAnchors + i
+    // OPTIMISATION: We only care about person (class 0).
+    // Instead of looping through all 80 classes for each of 6300 anchors,
+    // we directly read index for class 0 = offset 4.
+    const personOffset = 4 * numAnchors;
+
     for (let i = 0; i < numAnchors; i++) {
-        // Find the class with the highest probability
-        let maxClassConf = 0;
-        let classId = -1;
-        
-        for (let c = 0; c < numClasses; c++) {
-            const conf = outputData[(4 + c) * numAnchors + i];
-            if (conf > maxClassConf) {
-                maxClassConf = conf;
-                classId = c;
-            }
-        }
+        const conf = outputData[personOffset + i];
 
-        if (maxClassConf > confidenceThreshold && classId === 0) {
-            const cx = outputData[0 * numAnchors + i];
-            const cy = outputData[1 * numAnchors + i];
-            const w = outputData[2 * numAnchors + i];
-            const h = outputData[3 * numAnchors + i];
+        if (conf > confidenceThreshold) {
+            const cx = outputData[i];
+            const cy = outputData[numAnchors + i];
+            const w  = outputData[2 * numAnchors + i];
+            const h  = outputData[3 * numAnchors + i];
 
-            const x1 = cx - w / 2;
-            const y1 = cy - h / 2;
-            const x2 = cx + w / 2;
-            const y2 = cy + h / 2;
-
-            boxes.push({ x1, y1, x2, y2, confidence: maxClassConf, classId });
+            boxes.push({
+                x1: cx - w / 2,
+                y1: cy - h / 2,
+                x2: cx + w / 2,
+                y2: cy + h / 2,
+                confidence: conf,
+                classId: 0
+            });
         }
     }
 
@@ -57,7 +52,6 @@ export function processYoloOutput(
  * Non-Maximum Suppression to remove overlapping duplicate boxes.
  */
 function applyNMS(boxes: BoundingBox[], iouThreshold: number): BoundingBox[] {
-    // Sort boxes by confidence, descending
     boxes.sort((a, b) => b.confidence - a.confidence);
 
     const result: BoundingBox[] = [];
@@ -65,10 +59,7 @@ function applyNMS(boxes: BoundingBox[], iouThreshold: number): BoundingBox[] {
     for (const box of boxes) {
         let suppress = false;
         for (const resBox of result) {
-            if (box.classId !== resBox.classId) continue;
-            
-            const iou = calculateIoU(box, resBox);
-            if (iou > iouThreshold) {
+            if (calculateIoU(box, resBox) > iouThreshold) {
                 suppress = true;
                 break;
             }

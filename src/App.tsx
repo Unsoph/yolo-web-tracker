@@ -3,6 +3,10 @@ import * as ort from 'onnxruntime-web';
 import { processYoloOutput } from './utils/yoloUtils';
 import { SimpleTracker, type TrackedObject } from './utils/tracker';
 
+// ---- CONSTANTS ----
+const MODEL_INPUT_SIZE = 320;  // Smaller = faster. 320 is the sweet spot for speed.
+const PIXELS = MODEL_INPUT_SIZE * MODEL_INPUT_SIZE;
+
 function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -10,19 +14,17 @@ function App() {
   const [selectedTrackId, setSelectedTrackId] = useState<number | null>(null);
   const [fps, setFps] = useState(0);
 
-  // Refs for the animation loop (these persist without causing re-renders)
   const trackerRef = useRef(new SimpleTracker());
   const selectedTrackIdRef = useRef<number | null>(null);
   const currentTracksRef = useRef<TrackedObject[]>([]);
   const facingModeRef = useRef<'user' | 'environment'>('environment');
   const runningRef = useRef(true);
 
-  // Keep ref in sync with state
   useEffect(() => {
     selectedTrackIdRef.current = selectedTrackId;
   }, [selectedTrackId]);
 
-  // ---- Hit-test logic shared between mouse and touch ----
+  // ---- Shared hit-test for mouse + touch ----
   const hitTest = useCallback((clientX: number, clientY: number) => {
     if (!canvasRef.current) return;
     const rect = canvasRef.current.getBoundingClientRect();
@@ -31,8 +33,7 @@ function App() {
     const x = (clientX - rect.left) * scaleX;
     const y = (clientY - rect.top) * scaleY;
 
-    // Pad the hitbox by 15px on each side so tapping on mobile is forgiving
-    const pad = 15;
+    const pad = 20;
     let clickedOnObject = false;
 
     for (const track of currentTracksRef.current) {
@@ -45,34 +46,24 @@ function App() {
         break;
       }
     }
-
-    if (!clickedOnObject) {
-      setSelectedTrackId(null);
-    }
+    if (!clickedOnObject) setSelectedTrackId(null);
   }, []);
 
-  // Mouse click handler (desktop)
   const handleCanvasClick = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     hitTest(e.clientX, e.clientY);
   }, [hitTest]);
 
-  // Touch handler (mobile)
   const handleCanvasTouch = useCallback((e: React.TouchEvent<HTMLCanvasElement>) => {
-    e.preventDefault(); // prevent double-firing with click
-    if (e.touches.length > 0) {
-      hitTest(e.touches[0].clientX, e.touches[0].clientY);
-    }
+    e.preventDefault();
+    if (e.touches.length > 0) hitTest(e.touches[0].clientX, e.touches[0].clientY);
   }, [hitTest]);
 
-  // Function to switch between front and back camera
   const toggleCamera = async () => {
     const newMode = facingModeRef.current === 'user' ? 'environment' : 'user';
     facingModeRef.current = newMode;
 
-    // Stop existing stream
     if (videoRef.current && videoRef.current.srcObject) {
-      const stream = videoRef.current.srcObject as MediaStream;
-      stream.getTracks().forEach(track => track.stop());
+      (videoRef.current.srcObject as MediaStream).getTracks().forEach(t => t.stop());
     }
 
     try {
@@ -82,9 +73,7 @@ function App() {
       });
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        await new Promise((resolve) => {
-          if (videoRef.current) videoRef.current.onloadedmetadata = resolve;
-        });
+        await new Promise(r => { if (videoRef.current) videoRef.current.onloadedmetadata = r; });
         videoRef.current.play();
       }
     } catch (err) {
@@ -92,7 +81,7 @@ function App() {
     }
   };
 
-  // ---- Main effect: camera + model + inference loop ----
+  // ---- Main effect ----
   useEffect(() => {
     let session: ort.InferenceSession;
     runningRef.current = true;
@@ -105,9 +94,7 @@ function App() {
         });
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
-          await new Promise((resolve) => {
-            if (videoRef.current) videoRef.current.onloadedmetadata = resolve;
-          });
+          await new Promise(r => { if (videoRef.current) videoRef.current.onloadedmetadata = r; });
           videoRef.current.play();
         }
       } catch (err) {
@@ -115,7 +102,7 @@ function App() {
       }
     };
 
-    const loadModelAndRun = async () => {
+    const run = async () => {
       await setupCamera();
 
       try {
@@ -126,62 +113,63 @@ function App() {
         return;
       }
 
-      const inputShape = [1, 3, 640, 640];
-      const offscreenCanvas = document.createElement('canvas');
-      offscreenCanvas.width = 640;
-      offscreenCanvas.height = 640;
-      const offscreenCtx = offscreenCanvas.getContext('2d');
+      // ---- PRE-ALLOCATE BUFFERS (no GC pressure per frame) ----
+      const inputShape = [1, 3, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE];
+      const float32Data = new Float32Array(3 * PIXELS); // reused every frame
+
+      const offscreen = document.createElement('canvas');
+      offscreen.width = MODEL_INPUT_SIZE;
+      offscreen.height = MODEL_INPUT_SIZE;
+      const offCtx = offscreen.getContext('2d', { willReadFrequently: true })!;
+
+      let lastTime = performance.now();
+      let frameCount = 0;
 
       // ---- GATED INFERENCE LOOP ----
-      // Instead of requestAnimationFrame (which fires before inference finishes),
-      // we use a while-loop with awaits. The next frame only starts AFTER the
-      // previous inference is completely done. This prevents frame pile-up.
-      let lastTime = performance.now();
-
       while (runningRef.current) {
-        if (!videoRef.current || !canvasRef.current || !offscreenCtx || !session) {
-          await new Promise(r => setTimeout(r, 100));
+        if (!videoRef.current || !canvasRef.current || !session) {
+          await new Promise(r => setTimeout(r, 50));
           continue;
         }
 
         const video = videoRef.current;
         const canvas = canvasRef.current;
         const ctx = canvas.getContext('2d');
-        if (!ctx) break;
-
-        if (video.videoWidth === 0 || video.videoHeight === 0) {
-          await new Promise(r => setTimeout(r, 100));
+        if (!ctx || video.videoWidth === 0) {
+          await new Promise(r => setTimeout(r, 50));
           continue;
         }
 
-        // Match canvas to video
         if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
           canvas.width = video.videoWidth;
           canvas.height = video.videoHeight;
         }
 
-        // Draw video → 640x640 offscreen canvas for YOLO
-        offscreenCtx.drawImage(video, 0, 0, 640, 640);
-        const imgData = offscreenCtx.getImageData(0, 0, 640, 640).data;
+        // Draw video → small offscreen canvas
+        offCtx.drawImage(video, 0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE);
+        const imgData = offCtx.getImageData(0, 0, MODEL_INPUT_SIZE, MODEL_INPUT_SIZE).data;
 
-        // RGBA → CHW float32 normalized
-        const float32Data = new Float32Array(3 * 640 * 640);
-        for (let i = 0; i < 640 * 640; i++) {
-          float32Data[i]                   = imgData[i * 4]     / 255.0; // R
-          float32Data[640 * 640 + i]       = imgData[i * 4 + 1] / 255.0; // G
-          float32Data[2 * 640 * 640 + i]   = imgData[i * 4 + 2] / 255.0; // B
+        // RGBA → CHW float32 (reusing pre-allocated buffer)
+        for (let i = 0; i < PIXELS; i++) {
+          const base = i * 4;
+          float32Data[i]             = imgData[base]     / 255.0;
+          float32Data[PIXELS + i]    = imgData[base + 1] / 255.0;
+          float32Data[2 * PIXELS + i] = imgData[base + 2] / 255.0;
         }
 
-        // Run inference (this is the slow part — we AWAIT it)
+        // Run inference
         const tensor = new ort.Tensor('float32', float32Data, inputShape);
         const results = await session.run({ images: tensor });
+        const output = results.output0;
+        const outputData = output.data as Float32Array;
 
-        const outputTensor = results.output0;
-        const boxes = processYoloOutput(outputTensor.data as Float32Array);
+        // Get number of anchors from output shape
+        const numAnchors = output.dims[2];
+        const boxes = processYoloOutput(outputData, 0.45, 0.3, numAnchors);
 
-        // Scale boxes from 640x640 back to video resolution
-        const scaleX = video.videoWidth / 640;
-        const scaleY = video.videoHeight / 640;
+        // Scale boxes back to video resolution
+        const scaleX = video.videoWidth / MODEL_INPUT_SIZE;
+        const scaleY = video.videoHeight / MODEL_INPUT_SIZE;
         for (const box of boxes) {
           box.x1 *= scaleX;
           box.x2 *= scaleX;
@@ -189,11 +177,11 @@ function App() {
           box.y2 *= scaleY;
         }
 
-        // Run tracker
+        // Track
         const tracks = trackerRef.current.update(boxes);
         currentTracksRef.current = tracks;
 
-        // Draw bounding boxes on canvas
+        // Draw
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
         for (const track of tracks) {
@@ -202,7 +190,7 @@ function App() {
           }
 
           const isLocked = track.trackId === selectedTrackIdRef.current;
-          const color = isLocked ? '#ff0000' : '#00ff00';
+          const color = isLocked ? '#ff3333' : '#00ff88';
           const lineW = isLocked ? 4 : 2;
 
           ctx.strokeStyle = color;
@@ -211,34 +199,35 @@ function App() {
           ctx.rect(track.x1, track.y1, track.x2 - track.x1, track.y2 - track.y1);
           ctx.stroke();
 
-          // Label with background for readability
-          const label = isLocked ? `LOCKED ID: ${track.trackId}` : `ID: ${track.trackId}`;
+          const label = isLocked ? `LOCKED #${track.trackId}` : `#${track.trackId}`;
           ctx.font = 'bold 14px Arial';
-          const textW = ctx.measureText(label).width;
-          ctx.fillStyle = 'rgba(0,0,0,0.6)';
-          ctx.fillRect(track.x1, track.y1 - 20, textW + 8, 20);
+          const tw = ctx.measureText(label).width;
+          ctx.fillStyle = 'rgba(0,0,0,0.65)';
+          ctx.fillRect(track.x1, track.y1 - 20, tw + 8, 20);
           ctx.fillStyle = color;
           ctx.fillText(label, track.x1 + 4, track.y1 - 5);
         }
 
-        // FPS counter
-        const now = performance.now();
-        const delta = now - lastTime;
-        lastTime = now;
-        if (delta > 0) setFps(Math.round(1000 / delta));
+        // FPS (smoothed over 10 frames)
+        frameCount++;
+        if (frameCount >= 10) {
+          const now = performance.now();
+          setFps(Math.round(10000 / (now - lastTime)));
+          lastTime = now;
+          frameCount = 0;
+        }
 
-        // Yield to the browser so the UI stays responsive
+        // Yield to browser
         await new Promise(r => requestAnimationFrame(r));
       }
     };
 
-    loadModelAndRun();
+    run();
 
     return () => {
       runningRef.current = false;
       if (videoRef.current && videoRef.current.srcObject) {
-        const stream = videoRef.current.srcObject as MediaStream;
-        stream.getTracks().forEach(track => track.stop());
+        (videoRef.current.srcObject as MediaStream).getTracks().forEach(t => t.stop());
       }
     };
   }, []);
@@ -248,46 +237,23 @@ function App() {
       <h2 style={{ margin: '5px 0' }}>Drone Tracker</h2>
       <p style={{ fontSize: '13px', margin: '5px 0 10px', color: '#aaa' }}>
         {modelLoaded
-          ? "Tap a bounding box to lock. Tap background to unlock."
+          ? "Tap a person to lock. Tap background to unlock."
           : "Loading YOLOv8 model…"}
       </p>
 
-      {/* Controls */}
       <div style={{ display: 'flex', justifyContent: 'center', gap: '10px', marginBottom: '10px', flexWrap: 'wrap' }}>
-        <button
-          onClick={toggleCamera}
-          style={{
-            padding: '10px 20px',
-            fontSize: '15px',
-            backgroundColor: '#0070f3',
-            color: 'white',
-            border: 'none',
-            borderRadius: '8px',
-            cursor: 'pointer'
-          }}
-        >
+        <button onClick={toggleCamera} style={btnStyle('#0070f3')}>
           Flip Camera 🔄
         </button>
         {selectedTrackId !== null && (
-          <button
-            onClick={() => setSelectedTrackId(null)}
-            style={{
-              padding: '10px 20px',
-              fontSize: '15px',
-              backgroundColor: '#e00',
-              color: 'white',
-              border: 'none',
-              borderRadius: '8px',
-              cursor: 'pointer'
-            }}
-          >
-            Unlock Target 🔓
+          <button onClick={() => setSelectedTrackId(null)} style={btnStyle('#e00')}>
+            Unlock 🔓
           </button>
         )}
       </div>
 
       {selectedTrackId !== null && (
-        <h3 style={{ color: '#ff4444', margin: '5px 0' }}>🔒 Target Locked: ID {selectedTrackId}</h3>
+        <h3 style={{ color: '#ff4444', margin: '5px 0' }}>🔒 Locked: #{selectedTrackId}</h3>
       )}
 
       {modelLoaded && (
@@ -297,33 +263,32 @@ function App() {
       <div style={{ position: 'relative', display: 'inline-block', width: '100%', maxWidth: '800px' }}>
         <video
           ref={videoRef}
-          style={{
-            display: 'block',
-            borderRadius: '8px',
-            border: '2px solid #333',
-            width: '100%',
-            height: 'auto'
-          }}
-          playsInline
-          muted
+          style={{ display: 'block', borderRadius: '8px', border: '2px solid #333', width: '100%', height: 'auto' }}
+          playsInline muted
         />
         <canvas
           ref={canvasRef}
           onClick={handleCanvasClick}
           onTouchStart={handleCanvasTouch}
           style={{
-            position: 'absolute',
-            top: 0,
-            left: 0,
-            cursor: 'crosshair',
-            width: '100%',
-            height: '100%',
-            touchAction: 'none'   // prevents browser from hijacking touch gestures
+            position: 'absolute', top: 0, left: 0,
+            cursor: 'crosshair', width: '100%', height: '100%',
+            touchAction: 'none'
           }}
         />
       </div>
     </div>
   );
 }
+
+const btnStyle = (bg: string): React.CSSProperties => ({
+  padding: '10px 20px',
+  fontSize: '15px',
+  backgroundColor: bg,
+  color: 'white',
+  border: 'none',
+  borderRadius: '8px',
+  cursor: 'pointer',
+});
 
 export default App;
