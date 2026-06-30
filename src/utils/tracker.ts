@@ -6,10 +6,24 @@ export interface TrackedObject extends BoundingBox {
 }
 
 /**
- * IoU tracker tuned for LOW FPS (~5-15) with sticky lock mode.
+ * Calculates Mean Squared Error between two color patches.
+ * Both patches must be of the same length. Returns 0 if invalid.
+ */
+function colorDistance(patch1: number[], patch2: number[]): number {
+    if (!patch1 || !patch2 || patch1.length !== patch2.length || patch1.length === 0) return 0;
+    let sum = 0;
+    for (let i = 0; i < patch1.length; i++) {
+        sum += (patch1[i] - patch2[i]) ** 2;
+    }
+    return sum / patch1.length;
+}
+
+/**
+ * IoU tracker tuned for LOW FPS (~5-15) with robust sticky lock mode.
  * 
  * At 5 FPS each frame is 200ms apart — people move a LOT between frames.
- * All thresholds are set very permissively to account for this.
+ * We use an aggressive IoU matcher, and a special color-aware fallback
+ * for the locked target to prevent ID swapping.
  */
 export class SimpleTracker {
     private tracks: TrackedObject[] = [];
@@ -53,7 +67,7 @@ export class SimpleTracker {
         }
 
         // STICKY LOCK: If the locked target wasn't matched by IoU,
-        // use a generous distance + size fallback (ONLY for this one track).
+        // use a generous distance + size + color fallback (ONLY for this one track).
         if (lockedTrackId !== null) {
             const lockedIdx = this.tracks.findIndex(t => t.trackId === lockedTrackId);
             if (lockedIdx !== -1 && !matchedTracks.has(lockedIdx)) {
@@ -63,7 +77,7 @@ export class SimpleTracker {
                 const trackArea = (track.x2 - track.x1) * (track.y2 - track.y1);
 
                 let bestIdx = -1;
-                let bestDist = 400; // very generous — at 5fps people move far
+                let bestCost = Infinity;
 
                 for (let d = 0; d < detections.length; d++) {
                     if (matchedDets.has(d)) continue;
@@ -74,10 +88,21 @@ export class SimpleTracker {
 
                     const dist = Math.sqrt((detCx - trackCx) ** 2 + (detCy - trackCy) ** 2);
                     const sizeRatio = Math.min(detArea, trackArea) / Math.max(detArea, trackArea);
+                    
+                    let colDist = 0;
+                    if (track.colorPatch && det.colorPatch) {
+                        colDist = colorDistance(track.colorPatch, det.colorPatch);
+                    }
 
-                    if (dist < bestDist && sizeRatio > 0.1) {
-                        bestDist = dist;
-                        bestIdx = d;
+                    // Strict matching requirements:
+                    // Max distance 400px, size ratio at least 0.1, color distance reasonable (< 0.1)
+                    if (dist < 400 && sizeRatio > 0.1 && colDist < 0.1) {
+                        // Create a combined cost (lower is better)
+                        const cost = (dist / 400) + (colDist * 5);
+                        if (cost < bestCost) {
+                            bestCost = cost;
+                            bestIdx = d;
+                        }
                     }
                 }
 
@@ -120,5 +145,14 @@ export class SimpleTracker {
         track.y2 = det.y2;
         track.confidence = det.confidence;
         track.missedFrames = 0;
+        
+        // Exponential moving average for color features to adapt to lighting changes
+        if (track.colorPatch && det.colorPatch) {
+            for (let i = 0; i < track.colorPatch.length; i++) {
+                track.colorPatch[i] = 0.8 * track.colorPatch[i] + 0.2 * det.colorPatch[i];
+            }
+        } else {
+            track.colorPatch = det.colorPatch;
+        }
     }
 }

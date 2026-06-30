@@ -1,11 +1,36 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import * as ort from 'onnxruntime-web';
-import { processYoloOutput } from './utils/yoloUtils';
+import { processYoloOutput, type BoundingBox } from './utils/yoloUtils';
 import { SimpleTracker, type TrackedObject } from './utils/tracker';
 
 // ---- CONSTANTS ----
 const MODEL_INPUT_SIZE = 320;  // Re-exported ONNX model at 320x320 for ~4x speedup
 const PIXELS = MODEL_INPUT_SIZE * MODEL_INPUT_SIZE;
+
+/** Helper to extract a 3x3 color patch from the float32 CHW image data */
+function extractColorPatch(box: BoundingBox, float32Data: Float32Array): number[] {
+  const patch: number[] = [];
+  const stepX = (box.x2 - box.x1) / 3;
+  const stepY = (box.y2 - box.y1) / 3;
+  
+  for (let row = 0; row < 3; row++) {
+    for (let col = 0; col < 3; col++) {
+      let cx = Math.floor(box.x1 + stepX * (col + 0.5));
+      let cy = Math.floor(box.y1 + stepY * (row + 0.5));
+      
+      cx = Math.max(0, Math.min(MODEL_INPUT_SIZE - 1, cx));
+      cy = Math.max(0, Math.min(MODEL_INPUT_SIZE - 1, cy));
+      
+      const idx = cy * MODEL_INPUT_SIZE + cx;
+      const r = float32Data[idx];
+      const g = float32Data[PIXELS + idx];
+      const b = float32Data[2 * PIXELS + idx];
+      
+      patch.push(r, g, b);
+    }
+  }
+  return patch;
+}
 
 function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -34,9 +59,18 @@ function App() {
     const y = (clientY - rect.top) * scaleY;
 
     const pad = 20;
+    
+    // Z-INDEX FIX: Sort tracks by area ascending (smallest first)
+    // This way, if a smaller box is completely inside a larger box, it gets clicked first.
+    const sortedTracks = [...currentTracksRef.current].sort((a, b) => {
+      const areaA = (a.x2 - a.x1) * (a.y2 - a.y1);
+      const areaB = (b.x2 - b.x1) * (b.y2 - b.y1);
+      return areaA - areaB;
+    });
+
     let clickedOnObject = false;
 
-    for (const track of currentTracksRef.current) {
+    for (const track of sortedTracks) {
       if (
         x >= track.x1 - pad && x <= track.x2 + pad &&
         y >= track.y1 - pad && y <= track.y2 + pad
@@ -167,6 +201,11 @@ function App() {
         const numAnchors = output.dims[2];
         const boxes = processYoloOutput(outputData, 0.45, 0.3, numAnchors);
 
+        // ROBUST LOCK: Extract color features before scaling boxes
+        for (const box of boxes) {
+          box.colorPatch = extractColorPatch(box, float32Data);
+        }
+
         // Scale boxes back to video resolution
         const scaleX = video.videoWidth / MODEL_INPUT_SIZE;
         const scaleY = video.videoHeight / MODEL_INPUT_SIZE;
@@ -184,7 +223,21 @@ function App() {
         // Draw
         ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-        for (const track of tracks) {
+        // Z-INDEX FIX: Sort tracks by area descending (largest first)
+        // This way, largest boxes are drawn first, and smaller ones are drawn ON TOP of them.
+        const sortedTracksToDraw = [...tracks].sort((a, b) => {
+          const areaA = (a.x2 - a.x1) * (a.y2 - a.y1);
+          const areaB = (b.x2 - b.x1) * (b.y2 - b.y1);
+          return areaB - areaA;
+        });
+
+        // Ensure the locked track is always drawn absolute last (on top of everything)
+        const lockedTracks = sortedTracksToDraw.filter(t => t.trackId === selectedTrackIdRef.current);
+        const otherTracks = sortedTracksToDraw.filter(t => t.trackId !== selectedTrackIdRef.current);
+        const finalDrawOrder = [...otherTracks, ...lockedTracks];
+
+        for (const track of finalDrawOrder) {
+          // If we have a locked target, don't draw others
           if (selectedTrackIdRef.current !== null && track.trackId !== selectedTrackIdRef.current) {
             continue;
           }

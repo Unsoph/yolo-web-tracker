@@ -5,6 +5,7 @@ export interface BoundingBox {
     y2: number;
     confidence: number;
     classId: number;
+    colorPatch?: number[];
 }
 
 /**
